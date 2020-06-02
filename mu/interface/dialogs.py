@@ -21,8 +21,10 @@ import sys
 import logging
 import csv
 import shutil
-from PyQt5.QtCore import QSize, QProcess, QTimer
+import re
+from PyQt5.QtCore import QSize, QProcess, QTimer, Qt, QIODevice
 from PyQt5.QtWidgets import (
+    QHBoxLayout,
     QVBoxLayout,
     QListWidget,
     QLabel,
@@ -34,9 +36,14 @@ from PyQt5.QtWidgets import (
     QWidget,
     QCheckBox,
     QLineEdit,
+    QPushButton,
+    QGroupBox,
+    QComboBox,
+    QMessageBox
 )
 from PyQt5.QtGui import QTextCursor
 from mu.resources import load_icon
+from mu.contrib import mpyfs as mpy_serial
 
 
 logger = logging.getLogger(__name__)
@@ -224,6 +231,278 @@ class PackagesWidget(QWidget):
         self.text_area.setPlainText(packages)
         widget_layout.addWidget(self.text_area)
 
+class MPyPackagesWidget(QWidget):
+    """
+    Used for editing and displaying 3rd party packages installed via pip to be
+    used with Python 3 mode.
+    """
+
+    def setup(self, mode):
+        widget_layout = QVBoxLayout()
+        self.setLayout(widget_layout)
+
+        # Instructions
+        grp_instructions = QGroupBox(
+            _("How to install MicroPython library to your device")
+        )
+        grp_instructions_vbox = QVBoxLayout()
+        grp_instructions.setLayout(grp_instructions_vbox)
+        instructions = _(
+            "&nbsp;1. Connect your device<br/>"
+            "&nbsp;2. Press 'Wi-Fi Scan' in Wi-Fi Connection area<br/>"
+            "&nbsp;4. Select SSID from the combo box<br/>"
+            "&nbsp;5. Write password in the text area<br/>"
+            "&nbsp;6. Press 'Connect'<br/>"
+            "&nbsp;7. Write libraries you want install in Update/Install libraries area<br/>"
+            "&nbsp;8. Press 'Start'<br/>"
+        )
+        label = QLabel(instructions)
+        label.setTextFormat(Qt.RichText)
+        label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        label.setOpenExternalLinks(True)
+        label.setWordWrap(True)
+        grp_instructions_vbox.addWidget(label)
+        widget_layout.addWidget(grp_instructions)
+
+        # WiFi area
+        label_layout = QVBoxLayout()
+        label_ssid = QLabel(_("SSID:"))
+        label_pwd = QLabel(_("Password:"))
+        label_layout.addWidget(label_ssid)
+        label_layout.addWidget(label_pwd)
+
+        setting_layout = QVBoxLayout()
+        self.list_ssid = QComboBox()
+        self.list_ssid.setEditable(True)
+        self.line_pwd = QLineEdit()
+        setting_layout.addWidget(self.list_ssid)
+        setting_layout.addWidget(self.line_pwd)
+
+        button_layout = QVBoxLayout()
+        self.button_scan = QPushButton(_("Wi-Fi Scan"))
+        self.button_scan.setEnabled(True)
+        button_layout.addWidget(self.button_scan, alignment=Qt.AlignTop)
+
+        conf_layout = QHBoxLayout()
+        conf_layout.addLayout(label_layout)
+        conf_layout.addLayout(setting_layout)
+        conf_layout.addLayout(button_layout)
+
+        self.button_conn = QPushButton(_("Connection test"))
+        self.button_conn.setCheckable(True)
+        self.button_conn.setEnabled(False)
+
+        wifi_layout = QVBoxLayout()
+        wifi_layout.addLayout(conf_layout)
+        wifi_layout.addWidget(self.button_conn)
+
+        groupbox = QGroupBox(_("Wi-Fi Connection"))
+        groupbox.setLayout(wifi_layout)
+        widget_layout.addWidget(groupbox)
+
+
+        # Install area
+        self.text_area = QPlainTextEdit()
+        self.text_area.setLineWrapMode(QPlainTextEdit.NoWrap)
+        label = QLabel(
+            _(
+                "Each separate package name should be on a new "
+                "line. Packages are installed from PyPI "
+                "(see: https://pypi.org/)."
+            )
+        )
+        self.button_inst = QPushButton(_("Start"))
+        self.button_inst.setEnabled(False)
+
+        inst_layout = QVBoxLayout()
+        inst_layout.addWidget(label)
+        inst_layout.addWidget(self.text_area)
+        inst_layout.addWidget(self.button_inst)
+
+        self.groupbox_install = QGroupBox(_("Update/Install libraries"))
+        self.groupbox_install.setLayout(inst_layout)
+        self.groupbox_install.setEnabled(False)
+        widget_layout.addWidget(self.groupbox_install)
+
+        widget_layout.addStretch()
+
+        # Set event
+        self.button_scan.clicked.connect(self.scan)
+        self.button_conn.clicked.connect(self.connect)
+        self.button_inst.clicked.connect(self.install)
+
+        # self.button_conn.installEventFilter(self)
+        self.list_ssid.editTextChanged.connect(self.wifi_info_changed)
+        self.line_pwd.textChanged.connect(self.wifi_info_changed)
+        self.text_area.textChanged.connect(self.library_info_changed)
+
+        self.mode = mode
+        self.serial = None
+
+    def scan(self):
+        if self.mode.repl:
+            self.mode.toggle_repl(None)
+        if self.mode.plotter:
+            self.mode.toggle_plotter(None)
+        if not self.mode.fs is None:
+            self.mode.toggle_files(None)
+
+        # Clear
+        self.list_ssid.clear()
+
+        port, serial_number = self.mode.find_device()
+        self.serial = mpy_serial.open_serial(port)
+        mpy_serial.raw_on(self.serial)
+
+        # Get AP Informations
+        command = [
+            "import network",
+            "sta = network.WLAN(network.STA_IF)",
+            "sta.active(False)",
+            "sta.active(True)",
+            "print(sta.scan())"
+        ]
+        try:
+            out, err = mpy_serial.send_cmd_blocking(self.serial, command)
+        except IOError as e:
+            QMessageBox.critical(None, _("Scan Error"), _("{0}".format(e)), QMessageBox.Yes)
+            mpy_serial.close_serial(self.serial)
+            return
+
+        # Display SSIDs
+        aps = re.findall(r"\((.*?)\)", str(out))
+        for ap in aps:
+            info = ap.split(',')
+            ssid = re.sub(r"['\\]", "", info[0][1:])
+            self.list_ssid.addItem(ssid)
+
+
+        mpy_serial.raw_off(self.serial)
+        mpy_serial.close_serial(self.serial)
+
+    def connect(self):
+        port, serial_number = self.mode.find_device()
+        self.serial = mpy_serial.open_serial(port)
+        mpy_serial.raw_on(self.serial)
+
+        # Get AP Informations
+        connect_command = "sta.connect('" + self.list_ssid.currentText() + "', '" + self.line_pwd.text() + "')"
+        command = [
+            "import network",
+            "sta = network.WLAN(network.STA_IF)",
+            "sta.active(True)",
+            connect_command,
+            "while not sta.isconnected():\n pass",
+            "sta.disconnect()",
+            "sta.active(False)",
+        ]
+
+        try:
+            out, err = mpy_serial.send_cmd_blocking(self.serial, command)
+        except IOError as e:
+            QMessageBox.critical(None, _("WiFi Connect Error"), _("{0}".format(e)), QMessageBox.Yes)
+            mpy_serial.raw_off(self.serial)
+            mpy_serial.close_serial(self.serial)
+            self.button_conn.setEnabled(True)
+            return
+
+        self.button_conn.setEnabled(True)
+        self.button_conn.setText(_("OK"))
+
+        self.list_ssid.setEnabled(False)
+        self.line_pwd.setEnabled(False)
+        self.button_scan.setEnabled(False)
+        self.button_conn.setEnabled(False)
+
+        self.groupbox_install.setEnabled(True)
+
+    def install(self):
+        self.output_dialog = MpyPackageDialog(self)
+        self.output_dialog.setup()
+        self.output_dialog.show()
+
+        # Get AP Informations
+        connect_command = "sta.connect('" + self.list_ssid.currentText() + "', '" + self.line_pwd.text() + "')"
+        command = [
+            "import network",
+            "import upip",
+            "sta = network.WLAN(network.STA_IF)",
+            "sta.active(True)",
+            connect_command,
+            "while not sta.isconnected():\n pass",
+        ]
+        libs = self.text_area.toPlainText()
+        libs = libs.split('\n')
+        libs = [l for l in libs if l != '']
+        logger.info(libs)
+        for lib in libs:
+            upip_command = "upip.install('" + lib + "')"
+            command.append(upip_command)
+
+        # Get AP Informations
+        try:
+            # out, err = mpy_serial.send_cmd_blocking(self.serial, command)
+            mpy_serial.send_cmd(self.serial, command, self.on_serial_read)
+        except IOError as e:
+            QMessageBox.critical(None, _("Wi-Fi Connect Error"), _("{0}".format(e)), QMessageBox.Yes)
+            mpy_serial.close_serial(self.serial)
+            self.button_conn.setEnabled(True)
+            return
+
+    def wifi_info_changed(self):
+        if (len(self.line_pwd.text()) > 0) and (self.list_ssid.currentText() != ''):
+            self.button_conn.setEnabled(True)
+        else:
+            self.button_conn.setEnabled(False)
+
+    def library_info_changed(self):
+        if (len(self.text_area.toPlainText().strip()) > 0):
+            self.button_inst.setEnabled(True)
+        else:
+            self.button_inst.setEnabled(False)
+
+    def on_serial_read(self):
+        """
+        Called when the connected device is ready to send data via the serial
+        connection. It reads all the available data, emits the data_received
+        signal with the received bytes and, if appropriate, emits the
+        tuple_received signal with the tuple created from the bytes received.
+        """
+
+        """
+        Add data to the end of the text area.
+        """
+        msg = bytes(self.serial.readAll())  # get all the available bytes.
+        cursor = self.output_dialog.text_area.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(msg.decode('utf-8'))
+        cursor.movePosition(QTextCursor.End)
+        self.output_dialog.text_area.setTextCursor(cursor)
+
+
+class MpyPackageDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def setup(self):
+        # self.dlg = QDialog(self)
+        # self.dlg.setWindowFlags(Qt.WindowStaysOnTopHint)
+        # Basic layout.
+        self.setMinimumSize(600, 400)
+        self.setWindowTitle(_("Third Party Package Status"))
+        widget_layout = QVBoxLayout()
+        self.setLayout(widget_layout)
+        # Text area for pip output.
+        self.text_area = QPlainTextEdit()
+        self.text_area.setReadOnly(True)
+        self.text_area.setLineWrapMode(QPlainTextEdit.NoWrap)
+        widget_layout.addWidget(self.text_area)
+        # Buttons.
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        self.button_box.button(QDialogButtonBox.Ok).setEnabled(True)
+        self.button_box.accepted.connect(self.accept)
+        widget_layout.addWidget(self.button_box)
+
 
 class AdminDialog(QDialog):
     """
@@ -234,7 +513,7 @@ class AdminDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-    def setup(self, log, settings, packages):
+    def setup(self, log, settings, packages, mode):
         self.setMinimumSize(600, 400)
         self.setWindowTitle(_("Mu Administration"))
         widget_layout = QVBoxLayout()
@@ -263,6 +542,10 @@ class AdminDialog(QDialog):
         self.package_widget = PackagesWidget()
         self.package_widget.setup(packages)
         self.tabs.addTab(self.package_widget, _("Third Party Packages"))
+        if mode.name == "ESP MicroPython":
+            self.mpy_package_widget = MPyPackagesWidget()
+            self.mpy_package_widget.setup(mode)
+            self.tabs.addTab(self.mpy_package_widget, _("ESP Third Party Packages"))
 
     def settings(self):
         """
