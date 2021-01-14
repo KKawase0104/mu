@@ -238,7 +238,7 @@ class MPyPackagesWidget(QWidget):
     used with Python 3 mode.
     """
 
-    def setup(self, mode):
+    def setup(self, mode, device_list):
         widget_layout = QVBoxLayout()
         self.setLayout(widget_layout)
 
@@ -264,6 +264,9 @@ class MPyPackagesWidget(QWidget):
         label.setWordWrap(True)
         grp_instructions_vbox.addWidget(label)
         widget_layout.addWidget(grp_instructions)
+
+        self.device_selector = DeviceSelector(show_label=True, icon_first=True)
+        self.device_selector.set_device_list(device_list)
 
         # WiFi area
         label_layout = QVBoxLayout()
@@ -351,8 +354,11 @@ class MPyPackagesWidget(QWidget):
         # Clear
         self.list_ssid.clear()
 
-        port, serial_number = self.mode.find_device()
-        self.serial = mpy_serial.open_serial(port)
+        device = self.device_selector.selected_device()
+        if device is None:
+            return
+
+        self.serial = mpy_serial.open_serial(device.port)
         mpy_serial.raw_on(self.serial)
 
         # Get AP Informations
@@ -382,8 +388,8 @@ class MPyPackagesWidget(QWidget):
         mpy_serial.close_serial(self.serial)
 
     def connect(self):
-        port, serial_number = self.mode.find_device()
-        self.serial = mpy_serial.open_serial(port)
+        device = self.device_selector.selected_device()
+        self.serial = mpy_serial.open_serial(device.port)
         mpy_serial.raw_on(self.serial)
 
         # Get AP Informations
@@ -767,7 +773,7 @@ class AdminDialog(QDialog):
         self.tabs.addTab(self.package_widget, _("Third Party Packages"))
         if mode.name == "ESP MicroPython":
             self.mpy_package_widget = MPyPackagesWidget()
-            self.mpy_package_widget.setup(mode)
+            self.mpy_package_widget.setup(mode, device_list)
             self.tabs.addTab(self.mpy_package_widget, _("ESP Third Party Packages"))
         if mode.short_name == "esp":
             self.esp_widget = ESPFirmwareFlasherWidget(self)
